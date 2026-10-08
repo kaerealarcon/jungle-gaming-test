@@ -1,0 +1,90 @@
+import assert from 'node:assert/strict';
+import axios from 'axios';
+import { setupServer } from 'msw/node';
+import { handlers } from '../src/mocks/handlers';
+import { forgetDatabaseForTests, orderedRanking, readDatabase, resetDatabase } from '../src/mocks/database';
+import { setScenario } from '../src/mocks/scenarios';
+import { configurationKey, type RegisteredMatch } from '../src/records/contracts';
+import { recordsApi } from '../src/records/api';
+import { configureNetwork } from '../src/records/network';
+import { getRecordsState, queueMatch, resetOutboxForTests, retryRegistration, updateRegistration } from '../src/records/store';
+import { createGameConfig, defaultOptions } from '../src/game/config';
+import type { MatchResult } from '../src/player/result';
+
+const storage = new Map<string, string>();
+Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+  getItem: (key: string) => storage.get(key) ?? null,
+  setItem: (key: string, value: string) => { storage.set(key, value); },
+} });
+const server = setupServer(...handlers);
+server.listen({ onUnhandledRequest: 'error' });
+configureNetwork(Promise.resolve(true));
+try {
+  resetDatabase(); setScenario('success');
+  for (const invalidBody of [null, [], 'invalid', {}]) {
+    await assert.rejects(axios.post('http://localhost/api/matches', JSON.stringify(invalidBody), { headers: { 'Content-Type': 'application/json' } }), error => axios.isAxiosError(error) && error.response?.status === 400);
+  }
+  const config = createGameConfig(defaultOptions);
+  const key = configurationKey(config);
+  assert.equal(configurationKey({ ...config, spawn: { ...config.spawn, seed: 999 } }), key);
+  assert.notEqual(configurationKey(createGameConfig({ ...defaultOptions, spawnSeconds: 4 })), key);
+  const first = await recordsApi.ranking(key, 1);
+  assert.equal(first.items.length, 5); assert.equal(first.totalPages, 2);
+  assert.equal(first.items[0]?.rank, 1);
+  const second = await recordsApi.ranking(key, 2);
+  assert.equal(second.items[0]?.rank, 6);
+  const customKey = configurationKey(createGameConfig({ sessionSeconds: 90, spawnSeconds: 7 }));
+  const customRanking = await recordsApi.ranking(customKey, 1);
+  assert.equal(customRanking.total, 10); assert.equal(customRanking.totalPages, 2);
+  assert.ok(customRanking.items.every(item => item.configurationKey === customKey));
+  const playerId = getRecordsState().playerId;
+  assert.equal((await recordsApi.history(playerId, 1)).total, 0);
+  setScenario('multiple-pages');
+  assert.equal((await recordsApi.history(playerId, 1)).totalPages, 3);
+  assert.equal((await recordsApi.history(playerId, 2)).items.length, 5);
+  setScenario('success');
+  const match: MatchResult = { id: 'finished-match', completedAt: '2026-10-07T12:00:00Z', captainName: 'Jack', score: 42, durationSeconds: 120, reason: 'time', config };
+  queueMatch({ ...match, captainName: '' });
+  assert.equal(getRecordsState().entries[0]?.status, 'pending');
+  assert.equal(getRecordsState().entries[0]?.request.match.captainName, 'CAPTAIN JACK');
+  queueMatch(match); queueMatch(match);
+  assert.equal(getRecordsState().entries.length, 1);
+  updateRegistration(match.id, 'sending');
+  resetOutboxForTests();
+  assert.equal(getRecordsState().entries[0]?.status, 'pending', 'Interrupted submissions must survive refresh');
+  const registered = await recordsApi.register({ playerId, match });
+  assert.equal(registered.id, match.id);
+  assert.deepEqual(await recordsApi.register({ playerId, match: { ...match, score: 99 } }), registered, 'Idempotency retains the original payload');
+  assert.equal((await recordsApi.history(playerId, 1)).total, 1);
+  assert.equal((await recordsApi.ranking(key, 1)).items[0]?.id, match.id);
+  forgetDatabaseForTests();
+  assert.equal(readDatabase().filter(item => item.id === match.id).length, 1, 'Confirmed records survive refresh');
+  const tie = (id: string, completedAt: string) => ({ ...registered, id, completedAt });
+  assert.deepEqual(orderedRanking([tie('z', '2026-01-01'), tie('b', '2026-01-02'), tie('a', '2026-01-02')]).map(item => item.id), ['z', 'a', 'b']);
+  setScenario('empty'); assert.equal((await recordsApi.ranking(key, 1)).total, 0);
+  setScenario('ranking-error'); await assert.rejects(recordsApi.ranking(key, 1));
+  assert.equal((await recordsApi.history(playerId, 1)).total, 1);
+  setScenario('history-error'); await assert.rejects(recordsApi.history(playerId, 1));
+  setScenario('malformed-response'); await assert.rejects(recordsApi.history(playerId, 1), /invalid response/);
+  setScenario('http-400'); await assert.rejects(recordsApi.register({ playerId, match }));
+  setScenario('connection-error'); await assert.rejects(recordsApi.ranking(key, 1));
+  setScenario('timeout-after-save');
+  const uncertain = { ...match, id: 'timeout-match' };
+  queueMatch(uncertain);
+  await assert.rejects(recordsApi.register({ playerId, match: uncertain }), error => axios.isAxiosError(error) && error.code === 'ECONNABORTED');
+  assert.equal(readDatabase().filter(item => item.id === uncertain.id).length, 1);
+  updateRegistration(uncertain.id, 'failed', 'Timed out'); resetOutboxForTests();
+  assert.equal(getRecordsState().entries.find(entry => entry.request.match.id === uncertain.id)?.status, 'failed');
+  setScenario('success'); retryRegistration(uncertain.id);
+  const recovered: RegisteredMatch = await recordsApi.register(getRecordsState().entries.find(entry => entry.request.match.id === uncertain.id)!.request);
+  assert.equal(recovered.id, uncertain.id);
+  assert.equal((await recordsApi.history(playerId, 1)).total, 2);
+  assert.equal(readDatabase().filter(item => item.id === uncertain.id).length, 1);
+  storage.set('pirate-battle.outbox.v1', JSON.stringify([{ request: { playerId, match: { ...match, id: 'legacy-unnamed', captainName: '' } }, status: 'waiting-name' }]));
+  resetOutboxForTests();
+  assert.equal(getRecordsState().entries[0]?.status, 'pending');
+  assert.equal(getRecordsState().entries[0]?.request.match.captainName, 'CAPTAIN JACK');
+  await recordsApi.register(getRecordsState().entries[0]!.request);
+  assert.equal((await recordsApi.history(playerId, 1)).total, 3);
+  console.log('Records API, pagination, configuration comparison, outbox and idempotency checks passed.');
+} finally { server.close(); }
